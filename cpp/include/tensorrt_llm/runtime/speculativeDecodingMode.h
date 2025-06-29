@@ -55,6 +55,11 @@ public:
         return SpeculativeDecodingMode{kEagle};
     }
 
+    static auto constexpr Hydra()
+    {
+        return SpeculativeDecodingMode(kHydra);
+    }
+
     [[nodiscard]] bool constexpr isNone() const
     {
         return anyBitSet(kNone);
@@ -83,6 +88,11 @@ public:
     [[nodiscard]] bool constexpr isEagle() const
     {
         return anyBitSet(kEagle);
+    }
+
+    [[nodiscard]] bool constexpr isHydra() const
+    {
+        return anyBitSet(kHydra);
     }
 
     [[nodiscard]] bool constexpr updatesPositionIds() const

@@ -130,6 +130,9 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     max_medusa_token_len = builder_config.get('max_draft_len', 0)
     num_medusa_heads = builder_config.get('num_medusa_heads', 0)
 
+    max_hydra_token_len = builder_config.get('max_draft_len', 0)
+    num_hydra_heads = builder_config.get('num_hydra_heads', 0)
+
     skip_cross_attn_blocks = bool(config['pretrained_config'].get(
         'skip_cross_attn_blocks', False))
 
@@ -178,6 +181,8 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
+        num_hydra_heads=num_hydra_heads,
+        max_hydra_tokens=max_hydra_token_len,
         skip_cross_attn_blocks=skip_cross_attn_blocks,
         # ReDrafter
         redrafter_num_beams=redrafter_num_beams,
@@ -295,6 +300,10 @@ def _engine_config_to_model_config(engine_config: EngineConfig,
             pretrained_config, 'max_draft_len') else 0,
         num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
             pretrained_config, 'num_medusa_heads') else 0,
+        max_hydra_tokens=pretrained_config.max_draft_len if hasattr(
+            pretrained_config, 'max_draft_len') else 0,
+        num_hydra_heads=pretrained_config.num_hydra_heads if hasattr(
+            pretrained_config, 'num_hydra_heads') else 0,
         **rnn_configs_kwargs,
         num_kv_heads_per_layer=num_kv_heads_per_layer,
         num_kv_heads_per_cross_attn_layer=num_kv_heads_per_cross_attn_layer,
@@ -566,6 +575,7 @@ class ModelRunner(ModelRunnerMixin):
         debug_mode: bool,
         lora_ckpt_source: str,
         medusa_choices: List[List[int]],
+        hydra_choices: List[List[int]],
         stream: torch.cuda.Stream,
         gpu_weights_percent: float,
         enable_context_fmha_fp32_acc: Optional[bool],
@@ -597,6 +607,12 @@ class ModelRunner(ModelRunnerMixin):
 
             assert model_config.max_medusa_tokens > 0, \
                 "medusa_chioce is specified but model_config.max_medusa_tokens is 0."
+
+        if hydra_choices is not None:
+            assert session_cls == GenerationSession, "Hydra is only supported by GenerationSession"
+
+            assert model_config.max_medusa_tokens > 0, \
+                "hydra_chioce is specified but model_config.max_medusa_tokens is 0."
 
         if MpiComm.size() > runtime_mapping.gpus_per_node:
             assert MpiComm.local_size() == runtime_mapping.gpus_per_node
@@ -642,6 +658,7 @@ class ModelRunner(ModelRunnerMixin):
         debug_mode: bool = False,
         lora_ckpt_source: str = "hf",
         medusa_choices: List[List[int]] = None,
+        hydra_choices: List[List[int]] = None,
         stream: torch.cuda.Stream = None,
         gpu_weights_percent: float = 1,
         enable_context_fmha_fp32_acc: Optional[bool] = None,
@@ -663,6 +680,8 @@ class ModelRunner(ModelRunnerMixin):
                 Whether or not to turn on the debug mode.
             medusa_choices (List[List[int]]):
                 Medusa choices to use when in Medusa decoding
+            hydra_choices (List[List[int]]):
+                Hydra choices to use when in Hydra decoding
             stream (torch.cuda.Stream):
                 Stream to use.
             multi_block_mode (bool):
@@ -707,6 +726,10 @@ class ModelRunner(ModelRunnerMixin):
             if medusa_choices is not None:
                 assert model_config.max_medusa_tokens > 0, \
                     "medusa_choice is specified but model_config.max_medusa_tokens is 0."
+
+            elif hydra_choices is not None:
+                assert model_config.max_hydra_tokens > 0, \
+                    "hydra_choices is specified but model_config.max_hydra_tokens is 0."
 
             if not DISABLE_TORCH_DEVICE_SET:
                 torch.cuda.set_device(rank % runtime_mapping.gpus_per_node)
@@ -762,6 +785,7 @@ class ModelRunner(ModelRunnerMixin):
                 debug_mode=debug_mode,
                 lora_ckpt_source=lora_ckpt_source,
                 medusa_choices=medusa_choices,
+                hydra_choices=hydra_choices,
                 stream=stream,
                 gpu_weights_percent=gpu_weights_percent,
                 enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc,
@@ -837,6 +861,7 @@ class ModelRunner(ModelRunnerMixin):
                  stopping_criteria: Optional[StoppingCriteria] = None,
                  logits_processor: Optional[LogitsProcessor] = None,
                  medusa_choices: Optional[List[List[int]]] = None,
+                 hydra_choices: Optional[List[List[int]]] = None,
                  encoder_max_input_length: int = None,
                  encoder_input_features: List[torch.Tensor] = None,
                  encoder_output_lengths: List[torch.Tensor] = None,
@@ -868,6 +893,8 @@ class ModelRunner(ModelRunnerMixin):
                 Custom logits processors.
             medusa_choices (List[List[int]]):
                 Medusa decoding choices.
+            hydra_choices (List[List[int]]):
+                Hydra decoding choices.
             kwargs (Dict[str, Any]:
                 Ad hoc parametrization of sampling_config.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -945,6 +972,7 @@ class ModelRunner(ModelRunnerMixin):
             lora_manager=self.lora_manager,
             lora_uids=lora_uids,
             medusa_choices=medusa_choices,
+            hydra_choices=hydra_choices,
             enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc,
             multi_block_mode=self.multi_block_mode,
             encoder_max_input_length=encoder_max_input_length,

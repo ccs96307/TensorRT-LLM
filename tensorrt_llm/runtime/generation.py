@@ -490,9 +490,11 @@ class _Runtime(object):
                 context.set_input_shape(name, tensor.shape)
 
         for name in self.output_tensor_names:
+
             if name not in tensors:
                 dtype = self.engine.get_tensor_dtype(name)
                 shape = context.get_tensor_shape(name)
+
                 tensors[name] = RuntimeTensor.from_torch(
                     name,
                     torch.zeros(tuple(shape),
@@ -631,6 +633,8 @@ class ModelConfig:
     skip_cross_kv: bool = False
     num_medusa_heads: int = 0
     max_medusa_tokens: int = 0
+    num_hydra_heads: int = 0
+    max_hydra_tokens: int = 0
     paged_state: bool = True
     mamba_conv1d_plugin: bool = True
     conv_kernel: int = 0
@@ -835,6 +839,11 @@ class GenerationSession(object):
     medusa_tree_ids: List[int] = None
     medusa_position_offsets: List[int] = None
     medusa_temperature: float = 0.0
+    hydra_topks: List[int] = None
+    hydra_paths: List[List[int]] = None
+    hydra_tree_ids: List[int] = None
+    hydra_position_offsets: List[int] = None
+    hydra_temperature: float = 0.0
 
     def __init__(self,
                  model_config: ModelConfig,
@@ -1070,12 +1079,18 @@ class GenerationSession(object):
             if self.cross_attention and self.remove_input_padding:
                 expected_tensor_names += ['host_encoder_input_lengths']
 
-        if model_config.num_medusa_heads > 0:
+        if model_config.num_medusa_heads > 0 or model_config.num_hydra_heads > 0:
             expected_tensor_names += [
                 'spec_decoding_generation_lengths',
                 'spec_decoding_position_offsets', 'spec_decoding_packed_mask',
                 'spec_decoding_use', 'medusa_logits'
             ]
+        # elif model_config.num_hydra_heads > 0:
+        #     expected_tensor_names += [
+        #         'spec_decoding_generation_lengths',
+        #         'spec_decoding_position_offsets', 'spec_decoding_packed_mask',
+        #         'spec_decoding_use', 'hydra_logits'
+        #     ]
 
         if self.is_redrafter_mode:
             expected_tensor_names += get_redrafter_tensor_names()
@@ -1273,6 +1288,10 @@ class GenerationSession(object):
         return self.num_medusa_heads > 0
 
     @property
+    def is_hydra_mode(self):
+        return self.num_hydra_heads > 0
+
+    @property
     def is_redrafter_mode(self):
         return self._model_config.redrafter_num_beams > 0 and self._model_config.redrafter_draft_len_per_beam > 0
 
@@ -1280,11 +1299,19 @@ class GenerationSession(object):
     def max_draft_tokens(self):
         if self.is_redrafter_mode:
             return self._model_config.redrafter_num_beams * self._model_config.redrafter_draft_len_per_beam
+
+        if self.is_hydra_mode:
+            return self._model_config.max_hydra_tokens
+
         return self._model_config.max_medusa_tokens
 
     @property
     def num_medusa_heads(self):
         return self._model_config.num_medusa_heads
+
+    @property
+    def num_hydra_heads(self):
+        return self._model_config.num_hydra_heads
 
     @property
     def paged_state(self):
@@ -1602,6 +1629,27 @@ class GenerationSession(object):
                     [batch_size, self.num_medusa_heads, self.vocab_size_padded],
                     dtype=self._tensor_dtype('logits'),
                     device=self.device)
+        elif self.is_hydra_mode:
+            self.new_tokens = torch.zeros(
+                [batch_size, self.num_hydra_heads + 1],
+                dtype=torch.int32,
+                device=self.device)
+            self.hydra_output_tokens = torch.zeros(
+                [batch_size, self.num_draft_tokens],
+                dtype=torch.int32,
+                device=self.device)
+            self.generation_input_ids = torch.zeros(
+                [batch_size, self.num_draft_tokens + 1],
+                dtype=torch.int32,
+                device=self.device)
+            self.accept_lengths = torch.ones([batch_size],
+                                             dtype=torch.int32,
+                                             device=self.device)
+            if self.hydra_temperature != 0:
+                self.hydra_output_logits = torch.empty(
+                    [batch_size, self.num_hydra_heads, self.vocab_size_padded],
+                    dtype=self._tensor_dtype('logits'),
+                    device=self.device)
         elif scfg.num_beams > 1:
             self.new_tokens = torch.zeros([batch_size, scfg.num_beams, 1],
                                           dtype=torch.int32,
@@ -1727,6 +1775,47 @@ class GenerationSession(object):
             self.medusa_mask = medusa_fp_mask
         return
 
+    def _init_hydra(self, hydra_choices: List[List[int]]):
+        from tensorrt_llm.runtime.hydra_utils import (_hydra_setup,
+                                                      expand_choices_if_needed)
+        hydra_choices = expand_choices_if_needed(hydra_choices)
+        self.num_draft_tokens = len(hydra_choices)
+        assert self.num_draft_tokens > 0 and self.num_draft_tokens <= self.max_draft_tokens
+        hydra_info = _hydra_setup(hydra_choices)
+        self.hydra_topks = hydra_info.hydra_topks
+        self.hydra_mask = hydra_info.hydra_mask[1:, 1:].to(
+            torch.bool
+        )  # convert to bool, original mask includes true token as well
+
+        # Expand hydra position offsets to number of batch size in order to be compatible with the new Hydra.
+        target_shape = list(hydra_info.hydra_packed_mask.unsqueeze(0).shape)
+        target_shape[0] = self.batch_size
+        # Note: spec_decoding_packed_mask has no paddings in the first dimension.
+        self.spec_decoding_packed_mask = hydra_info.hydra_packed_mask.unsqueeze(
+            0).expand(target_shape).reshape(-1, target_shape[-1]).cuda()
+        self.spec_decoding_use = hydra_info.hydra_spec_decoding_use
+
+        self.hydra_paths = hydra_info.hydra_paths
+        self.hydra_tree_ids = hydra_info.hydra_tree_ids
+
+        # Expand hydra position offsets to number of batch size in order to be compatible with the new Hydra.
+        target_shape = list(
+            hydra_info.hydra_position_offsets.unsqueeze(0).shape)
+        target_shape[0] = self.batch_size
+        # Note: hydra_position_offsets still keeps the paddings in order to get max_gen_input_length from the shape info.
+        self.spec_decoding_position_offsets = hydra_info.hydra_position_offsets.unsqueeze(
+            0).expand(target_shape).int().cuda()
+        # Fixed sequence lengths currently.
+        # Support variable sequence lengths later.
+        self.spec_decoding_generation_lengths = (torch.ones(
+            (self.batch_size)) * (self.num_draft_tokens + 1)).int().cuda()
+        if not self.use_gpt_attention_plugin:
+            hydra_fp_mask = torch.zeros_like(self.hydra_mask,
+                                             dtype=torch.float32)
+            hydra_fp_mask[torch.logical_not(self.hydra_mask)] = float('-inf')
+            self.hydra_mask = hydra_fp_mask
+        return
+
     def _get_num_paged_blocks(self, max_attention_window_size,
                               sink_token_length):
         bubble_len = 0
@@ -1750,6 +1839,7 @@ class GenerationSession(object):
               lora_manager: LoraManager = None,
               lora_uids: List[str] = None,
               medusa_choices: List[List[int]] = None,
+              hydra_choices: List[List[int]] = None,
               multi_block_mode: bool = True,
               enable_context_fmha_fp32_acc: bool = None):
         # Store these params related to buffer size to check against
@@ -1758,7 +1848,7 @@ class GenerationSession(object):
         self.max_context_length = max_context_length
         self.max_new_tokens = max_new_tokens
         self.max_seq_length = max_context_length + max_new_tokens
-        if medusa_choices is not None or self.is_redrafter_mode:
+        if medusa_choices is not None or hydra_choices is not None or self.is_redrafter_mode:
             self.max_seq_length += self.max_draft_tokens
         self.beam_width = beam_width
         self.encoder_max_input_length = encoder_max_input_length
@@ -1842,6 +1932,9 @@ class GenerationSession(object):
         if medusa_choices is not None:
             self._init_medusa(medusa_choices)
 
+        if hydra_choices is not None:
+            self._init_hydra(hydra_choices)
+
         self.buffer = {}
         if self.mapping.is_last_pp_rank():
             if self.is_redrafter_mode:
@@ -1872,6 +1965,28 @@ class GenerationSession(object):
                 self.buffer['medusa_logits'] = torch.empty(
                     medusa_logits_shape if not self.gather_context_logits else
                     (self.num_medusa_heads, batch_size, max_context_length,
+                     self.vocab_size_padded),
+                    dtype=self._tensor_dtype('medusa_logits'),
+                    device=self.device)
+            elif self.is_hydra_mode:
+                self.buffer['logits'] = torch.empty(
+                    (batch_size, self.num_draft_tokens + 1,
+                     self.vocab_size_padded)
+                    if not self.gather_context_logits else
+                    (batch_size, max_context_length, self.vocab_size_padded),
+                    dtype=self._tensor_dtype('logits'),
+                    device=self.device)
+                hydra_logits_shape = (self.num_hydra_heads, batch_size,
+                                      (self.num_draft_tokens + 1),
+                                      self.vocab_size_padded)
+                if self.remove_input_padding:
+                    hydra_logits_shape = (self.num_hydra_heads, batch_size *
+                                          (self.num_draft_tokens + 1),
+                                          self.vocab_size_padded)
+
+                self.buffer['medusa_logits'] = torch.empty(
+                    hydra_logits_shape if not self.gather_context_logits else
+                    (self.num_hydra_heads, batch_size, max_context_length,
                      self.vocab_size_padded),
                     dtype=self._tensor_dtype('medusa_logits'),
                     device=self.device)
@@ -2064,7 +2179,7 @@ class GenerationSession(object):
                 alloc_bytes, set(self.mapping.tp_group))
             logger.debug(f'Allocated NVLS IPC memory: {alloc_bytes} bytes')
 
-        if self.is_medusa_mode:
+        if self.is_medusa_mode or self.is_hydra_mode:
             self.buffer[
                 'spec_decoding_packed_mask'] = self.spec_decoding_packed_mask
             self.buffer[
@@ -2073,7 +2188,7 @@ class GenerationSession(object):
                 'spec_decoding_generation_lengths'] = self.spec_decoding_generation_lengths
             self.buffer['spec_decoding_use'] = self.spec_decoding_use
         self.buffer_allocated = True
-        if self.is_medusa_mode:
+        if self.is_medusa_mode or self.is_hydra_mode:
             return self.num_draft_tokens
 
     def _allocate_empty_kv_cache_pools(self, kv_cache_type, num_blocks):
@@ -2239,6 +2354,8 @@ class GenerationSession(object):
                 set_redrafter_ctx_tensors(self, add_tensor, add_tensor_with_bs)
             add_tensor(self.buffer['logits'], 'logits')
             if self.is_medusa_mode:
+                add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
+            elif self.is_hydra_mode:
                 add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
 
             if not self.gather_context_logits or self.has_rnn_layers:
@@ -2451,7 +2568,7 @@ class GenerationSession(object):
             if self.cross_attention and self.remove_input_padding:
                 add_tensor(encoder_input_lengths.to('cpu'),
                            'host_encoder_input_lengths')
-        if self.is_medusa_mode:
+        if self.is_medusa_mode or self.is_hydra_mode:
             # Medusa mask and position offsets are fixed for the whole session.
             add_tensor(self.buffer['spec_decoding_packed_mask'],
                        'spec_decoding_packed_mask')
@@ -2534,6 +2651,9 @@ class GenerationSession(object):
             if self.is_medusa_mode:
                 add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
 
+            if self.is_hydra_mode:
+                add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
+
             if not self.gather_context_logits or self.has_rnn_layers:
                 add_tensor(last_token_ids, 'last_token_ids')
         else:
@@ -2550,7 +2670,7 @@ class GenerationSession(object):
             if self.is_redrafter_mode:
                 add_tensor_with_shape(self.buffer['flat_tokens'], 'input_ids',
                                       input_ids_shape)
-            elif self.is_medusa_mode:
+            elif self.is_medusa_mode or self.is_hydra_mode:
                 add_tensor_with_shape(self.generation_input_ids, 'input_ids',
                                       input_ids_shape)
             else:
@@ -2751,7 +2871,7 @@ class GenerationSession(object):
                     context_lengths, device=self.device).int()
                 add_tensor(device_request_types, 'device_request_types')
                 torch.cuda.nvtx.range_pop()
-            if self.is_medusa_mode or self.is_redrafter_mode:
+            if self.is_medusa_mode or self.is_hydra_mode or self.is_redrafter_mode:
                 host_past_key_value_lengths = self.sequence_length_buffer.cpu()
             else:
                 # previous [past_kv_length, is_context] has been deprecated. only past_kv_length should be given here
@@ -2828,7 +2948,7 @@ class GenerationSession(object):
                 add_tensor(encoder_input_lengths.to('cpu'),
                            'host_encoder_input_lengths')
 
-        if self.is_medusa_mode:
+        if self.is_medusa_mode or self.is_hydra_mode:
             # Spec Decoding mask and position offsets are fixed for the whole session for Medusa.
             add_tensor(self.buffer['spec_decoding_packed_mask'],
                        'spec_decoding_packed_mask')
@@ -2850,7 +2970,7 @@ class GenerationSession(object):
                                 remove_input_padding, **kwargs):
 
         last_token_ids = context_lengths.detach().clone()
-        if (self.is_medusa_mode
+        if (self.is_medusa_mode or self.is_hydra_mode
                 or self.is_redrafter_mode) and not remove_input_padding:
             # For Medusa, last_token_ids should contain the actual indices
             last_token_ids = last_token_ids - 1  # sub 1 from context_lengths for indices
@@ -2914,9 +3034,10 @@ class GenerationSession(object):
         step = kwargs.pop('step')
         last_token_ids = torch.ones_like(context_lengths)
         if use_gpt_attention_plugin and (self.is_medusa_mode
+                                         or self.is_hydra_mode
                                          or self.is_redrafter_mode):
             if remove_input_padding:
-                if self.is_medusa_mode:
+                if self.is_medusa_mode or self.is_hydra_mode:
                     # For Medusa, last_token_ids should be [bs * seq] and should contain the actual indices (starts from 1)
                     last_token_ids = torch.ones(batch_size *
                                                 (self.num_draft_tokens + 1),
@@ -3131,6 +3252,42 @@ class GenerationSession(object):
 
         return best_path, best_path_len, next_tokens
 
+    def find_best_hydra_path(self,
+                             batch_size,
+                             input_ids: torch.Tensor,
+                             next_logits,
+                             temp=0):
+        assert input_ids.shape[-1] == self.num_draft_tokens + 1
+        best_path = [0] * batch_size
+        best_path_len = [1] * batch_size
+        next_tokens = [None] * batch_size
+        zero_pad = torch.zeros((batch_size, 1),
+                               dtype=input_ids.dtype,
+                               device=input_ids.device)
+        input_ids = torch.cat((input_ids, zero_pad), dim=-1)
+        if temp == 0:
+            new_tokens_raw = torch.argmax(
+                next_logits, dim=-1
+            )  # TODO: can be done by treating [bs, nT, vocab] as [bs*nT, vocab] and using decoderOp?
+            new_tokens = torch.cat((new_tokens_raw, zero_pad), dim=-1)
+            input_paths = [
+                input_ids[b, self.hydra_paths] for b in range(batch_size)
+            ]
+            new_paths = [
+                new_tokens[b, self.hydra_paths] for b in range(batch_size)
+            ]
+            for b in range(batch_size):
+                equality = input_paths[b][:, 1:] == new_paths[b][:, :-1]
+                paths_correct_len = torch.cumprod(equality.int(),
+                                                  dim=1).sum(dim=1)
+                best_path_len[b] = paths_correct_len.max().item() + 1
+                if best_path_len[b] > 1:
+                    best_path[b] = torch.argmax(paths_correct_len)
+                next_tokens[b] = new_paths[b][
+                    best_path[b]][:best_path_len[b]].clone()
+
+        return best_path, best_path_len, next_tokens
+
     def filter_medusa_logits(self, batch_size, best_path, best_path_lengths,
                              medusa_logits):
         """
@@ -3149,6 +3306,24 @@ class GenerationSession(object):
             filtered_logits[:, b, ...] = medusa_logits[:, b, idx, ...]
         return filtered_logits
 
+    def filter_hydra_logits(self, batch_size, best_path, best_path_lengths,
+                            hydra_logits):
+        """
+            hydra_logits is of shape [nMH, bs, nMT+1, vocab]
+
+                Returns [nMH, bs, vocab]
+        """
+        filtered_logits = torch.empty(
+            (self.num_hydra_heads, batch_size, self.vocab_size_padded),
+            dtype=hydra_logits.dtype,
+            device=hydra_logits.device)
+        hydra_logits = hydra_logits.view(self.num_hydra_heads, batch_size,
+                                         self.num_draft_tokens + 1, -1)
+        for b in range(batch_size):
+            idx = self.hydra_paths[best_path[b], best_path_lengths[b] - 1]
+            filtered_logits[:, b, ...] = hydra_logits[:, b, idx, ...]
+        return filtered_logits
+
     def get_next_medusa_tokens(self, batch_size, next_medusa_logits):
         next_medusa_tokens = [
             torch.zeros((batch_size, 1),
@@ -3162,6 +3337,20 @@ class GenerationSession(object):
             next_medusa_tokens.append(medusa_token)
         next_medusa_tokens = torch.cat(next_medusa_tokens, dim=-1)
         return next_medusa_tokens
+
+    def get_next_hydra_tokens(self, batch_size, next_hydra_logits):
+        next_hydra_tokens = [
+            torch.zeros((batch_size, 1),
+                        dtype=torch.int32,
+                        device=next_hydra_logits.device)
+        ]  # dummy token for now, TODO: update tree_ids and remove this
+        for i in range(self.num_hydra_heads):
+            hydra_token = torch.topk(next_hydra_logits[i, :, :],
+                                     self.hydra_topks[i],
+                                     dim=-1).indices
+            next_hydra_tokens.append(hydra_token)
+        next_hydra_tokens = torch.cat(next_hydra_tokens, dim=-1)
+        return next_hydra_tokens
 
     def locate_accepted_draft_tokens(self, batch_size, best_path, best_path_len,
                                      draft_paths):
@@ -3184,13 +3373,15 @@ class GenerationSession(object):
             dtype=torch.int32,
             device='cuda')
         for seq_idx in range(batch_size):
-            cur_draft_paths = draft_paths if self.is_medusa_mode else draft_paths[
-                seq_idx]
+            cur_draft_paths = draft_paths if (
+                self.is_medusa_mode
+                or self.is_hydra_mode) else draft_paths[seq_idx]
             seq_start = accepted_draft_token_offsets_cpu[seq_idx]
             seq_end = accepted_draft_token_offsets_cpu[seq_idx + 1]
             seq_accepted_draft_count = seq_end - seq_start
             best_path_idx = best_path[seq_idx].cpu() if isinstance(
                 best_path[seq_idx], torch.Tensor) else best_path[seq_idx]
+
             seq_accepted_token_indices = cur_draft_paths[
                 best_path_idx, 1:1 + seq_accepted_draft_count]
             packed_accepted_draft_tokens_indices[
@@ -3222,6 +3413,17 @@ class GenerationSession(object):
             self.generation_input_ids[b, 0] = self.new_tokens[
                 b, self.accept_lengths[b] - 1]
             self.generation_input_ids[b, 1:] = self.medusa_output_tokens[b, :]
+
+    def next_hydra_input_ids(self):
+        # self.new_tokens [batch_size, padded_accepted_length]
+        # self.accept_lengths [batch_size]
+        # self.hydra_new_tokens [batch_size, num_draft_tokens]
+        # FIXME: using fused kernel to generate the new hydra input ids.
+        batch_size = self.new_tokens.shape[0]
+        for b in range(batch_size):
+            self.generation_input_ids[b, 0] = self.new_tokens[
+                b, self.accept_lengths[b] - 1]
+            self.generation_input_ids[b, 1:] = self.hydra_output_tokens[b, :]
 
     def reorder_kv_cache_for_beam_search(
         self,
@@ -3298,6 +3500,10 @@ class GenerationSession(object):
 
     def medusa_decode_and_verify(self, step, batch_size, logits):
         medusa_logits = self.buffer['medusa_logits']
+
+        print(f"medusa_logits: {medusa_logits}")
+        print(f"medusa_logits.shape: {medusa_logits.shape}")
+
         best_path = None
         best_path_lengths = None
         if step == 0:
@@ -3348,6 +3554,57 @@ class GenerationSession(object):
                                                                num_draft_tokens:]]
         return best_path, best_path_lengths
 
+    def hydra_decode_and_verify(self, step, batch_size, logits):
+        hydra_logits = self.buffer['medusa_logits']
+        print(f"hydra_logits: {hydra_logits}")
+        print(f"hydra_logits.shape: {hydra_logits.shape}")
+
+        best_path = None
+        best_path_lengths = None
+        if step == 0:
+            # logits buffer is of shape [bs, hydra_tokens+1, vocab]
+            # but during context phase, we get only [bs, 1, vocab] but contiguous
+            logits = logits.view(-1)[:batch_size * logits.shape[-1]].view(
+                batch_size, -1)
+            next_main_token_logits = logits.to(self.decoder_logits_dtype)
+            next_main_token = torch.argmax(next_main_token_logits,
+                                           dim=-1,
+                                           keepdim=True)
+            self.new_tokens = next_main_token
+            # NOTE: only one token's hydra logit will be written in.
+            hydra_logits = hydra_logits.view(self.num_draft_tokens + 1, -1)[0,
+                                                                            ...]
+            next_hydra_logits = hydra_logits.reshape(
+                self.num_hydra_heads, batch_size,
+                -1).to(self.decoder_logits_dtype)
+            next_hydra_tokens = self.get_next_hydra_tokens(
+                batch_size, next_hydra_logits)
+            self.hydra_output_tokens = next_hydra_tokens[:, self.hydra_tree_ids[
+                -self.num_draft_tokens:]]
+            self.accept_lengths = torch.ones([batch_size],
+                                             dtype=torch.int32,
+                                             device=self.device)
+        else:
+            next_token_logits = logits.to(self.decoder_logits_dtype)
+
+            best_path, best_path_lengths, next_main_tokens = self.find_best_hydra_path(
+                batch_size, self.generation_input_ids.view(batch_size, -1),
+                next_token_logits.view(batch_size, self.num_draft_tokens + 1,
+                                       -1))
+            self.accept_lengths = torch.tensor(best_path_lengths,
+                                               device=self.device)
+            self.new_tokens = torch.nested.to_padded_tensor(
+                torch.nested.nested_tensor(next_main_tokens, dtype=torch.int32),
+                self.end_ids[0])  #FIXME  end id padding.
+            next_hydra_logits = self.filter_hydra_logits(
+                batch_size, best_path, best_path_lengths, hydra_logits)
+            next_hydra_tokens = self.get_next_hydra_tokens(
+                batch_size, next_hydra_logits)
+
+            self.hydra_output_tokens = next_hydra_tokens[:, self.hydra_tree_ids[
+                -self.num_draft_tokens:]]
+        return best_path, best_path_lengths
+
     def process_logits_including_draft(self, step, batch_size, logits,
                                        next_step_buffer):
         """
@@ -3359,12 +3616,23 @@ class GenerationSession(object):
         6. Update sequence_length_buffer and past_kv_length
         """
         should_stop = torch.tensor([False], dtype=bool)
+
+        # print(f"logits: {logits}")
+
         if self.is_medusa_mode:
             # NOTE: this function call also updates self.[accept_lengths, new_tokens, medusa_output_tokens]
             best_path, best_path_lengths = self.medusa_decode_and_verify(
                 step, batch_size, logits)
             last_draft_paths = self.medusa_paths
             # print(best_path, self.new_tokens, self.medusa_output_tokens)
+            last_draft_tokens_len = self.num_draft_tokens if step > 0 else 0
+            cur_draft_tokens_len = self.num_draft_tokens
+        elif self.is_hydra_mode:
+            # NOTE: this function call also updates self.[accept_lengths, new_tokens, hydra_output_tokens]
+            best_path, best_path_lengths = self.hydra_decode_and_verify(
+                step, batch_size, logits)
+            last_draft_paths = self.hydra_paths
+            # print(best_path, self.new_tokens, self.hydra_output_tokens)
             last_draft_tokens_len = self.num_draft_tokens if step > 0 else 0
             cur_draft_tokens_len = self.num_draft_tokens
         elif self.is_redrafter_mode:
@@ -3403,6 +3671,8 @@ class GenerationSession(object):
         if step != self.max_new_tokens - 1 and not should_stop.item():
             if self.is_medusa_mode:
                 self.next_medusa_input_ids()
+            elif self.is_hydra_mode:
+                self.next_hydra_input_ids()
             if step != 0:
                 assert best_path is not None and best_path_lengths is not None
                 accepted_draft_token_offsets, packed_accepted_draft_tokens_indices = self.locate_accepted_draft_tokens(
@@ -3587,7 +3857,7 @@ class GenerationSession(object):
         context_logits = None
         if self.mapping.is_last_pp_rank():
             if step == 0 and self.gather_context_logits:
-                assert not self.is_medusa_mode and not self.is_redrafter_mode
+                assert not self.is_medusa_mode and not self.is_hydra_mode and not self.is_redrafter_mode
                 context_logits = self.buffer['logits'].detach().clone()
                 # gather last token of context
                 if self.remove_input_padding:
@@ -3612,7 +3882,7 @@ class GenerationSession(object):
                             batch_size, self.vocab_size_padded)
 
         if step == 0 and beam_width > 1:
-            assert not self.is_medusa_mode and not self.is_redrafter_mode
+            assert not self.is_medusa_mode and not self.is_hydra_mode and not self.is_redrafter_mode
             assert not self.has_rnn_layers
             # these tiled tensors are returned by handle_per_step(), so they can relay to the next generation calls
             if not self.use_gpt_attention_plugin:
@@ -3656,7 +3926,7 @@ class GenerationSession(object):
                 generation_logits = self.buffer['logits'].detach().clone()
 
         # Initialize sequence_lengths (no paddings) for the generation phase.
-        if step == 0 and not self.is_medusa_mode and not self.is_redrafter_mode:  # Medusa/ReDrafter has its own logic
+        if step == 0 and not self.is_medusa_mode and not self.is_hydra_mode and not self.is_redrafter_mode:  # Medusa/ReDrafter has its own logic
             self.sequence_length_buffer = context_lengths.detach().clone()
 
         if self.is_redrafter_mode:
@@ -3704,7 +3974,8 @@ class GenerationSession(object):
                     assert add_token_count > 0
                     for _ in range(add_token_count):
                         self.pools_kv_cache_manager.step([False] * batch_size)
-                if self.is_medusa_mode and self.num_draft_tokens > 0:
+                if (self.is_medusa_mode
+                        or self.is_hydra_mode) and self.num_draft_tokens > 0:
                     # Allocate kv cache token slots for next step.
                     # Make sure there are always > (num_draft_tokens + 1) free token slots.
                     # Allocate (num_draft_tokens + 1) * 2 for safety as we don't know the current step or next step's accepted lengths.
@@ -3792,7 +4063,7 @@ class GenerationSession(object):
                 should_stop = self.process_logits_including_draft(
                     step, batch_size, logits, next_step_tensors)
             elif logits is not None:
-                if self.is_medusa_mode:
+                if self.is_medusa_mode or self.is_hydra_mode:
                     should_stop = self.process_logits_including_draft(
                         step, batch_size, logits, next_step_tensors)
                 else:
@@ -3964,13 +4235,21 @@ class GenerationSession(object):
                 outputs['context_logits'] = outputs_context_logits
             if self.gather_generation_logits or output_generation_logits:
                 outputs['generation_logits'] = outputs_generation_logits
-            if self.is_medusa_mode or self.is_redrafter_mode:
+            if self.is_medusa_mode or self.is_hydra_mode or self.is_redrafter_mode:
                 outputs['steps_to_finish'] = num_steps
             if self.is_medusa_mode:
                 outputs['medusa_output_tokens'] = self.medusa_output_tokens
                 outputs['accept_lengths'] = self.accept_lengths
                 if self.medusa_temperature != 0.0:
                     outputs['medusa_output_logits'] = self.medusa_output_logits
+            elif self.is_hydra_mode:
+                outputs['hydra_output_tokens'] = self.hydra_output_tokens
+                outputs['accept_lengths'] = self.accept_lengths
+                if self.hydra_temperature != 0.0:
+                    outputs['hydra_output_logits'] = self.hydra_output_logits
+
+            print(outputs)
+
             return outputs
 
         benchmark_profiler = kwargs.get('benchmark_profiler', None)
@@ -4003,7 +4282,6 @@ class GenerationSession(object):
 
         next_step_tensors = None
         for step in range(0, self.max_new_tokens):
-
             should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections=cache_indirections,
                 step=step,
@@ -4054,7 +4332,7 @@ class GenerationSession(object):
 
             if should_stop is not None and should_stop.item():
                 profile_fn(benchmark_profiler, generation_phase_step_count)
-                if self.is_medusa_mode or self.is_redrafter_mode:
+                if self.is_medusa_mode or self.is_hydra_mode or self.is_redrafter_mode:
                     # just hack away for now
                     final_output_ids = self.output_ids.clone().unsqueeze(1)
                     final_output_ids = final_output_ids[:, :, :self.
@@ -4079,7 +4357,7 @@ class GenerationSession(object):
                 else:
                     return None
 
-        assert not self.is_medusa_mode and not self.is_redrafter_mode, "the custom decoder doesn't support medusa/redrafter."
+        assert not self.is_medusa_mode and not self.is_hydra_mode and not self.is_redrafter_mode, "the custom decoder doesn't support medusa/hydra/redrafter."
 
         profile_fn(benchmark_profiler, generation_phase_step_count)
 
@@ -4377,7 +4655,7 @@ class GenerationSession(object):
                     # cross attention paged kv cache should always share the context blocks across beams
                     # due to the fact that we are not adding new key/value cache to cross kv in generation
 
-        if self.is_medusa_mode or self.is_redrafter_mode:
+        if self.is_medusa_mode or self.is_hydra_mode or self.is_redrafter_mode:
             if self.quant_mode.has_kv_cache_quant():
                 # Since torch does not support fp8 now, using int8 here.
                 kv_cache_type = torch.int8

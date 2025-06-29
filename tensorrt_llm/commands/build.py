@@ -275,8 +275,12 @@ def parse_arguments():
     spec_parser.add_argument('--speculative_decoding_mode',
                              default=None,
                              choices=[
-                                 "draft_tokens_external", "lookahead_decoding",
-                                 "medusa", "explicit_draft_tokens", "eagle"
+                                 "draft_tokens_external",
+                                 "lookahead_decoding",
+                                 "medusa",
+                                 "explicit_draft_tokens",
+                                 "eagle",
+                                 "hydra",
                              ],
                              help="Mode of speculative decoding.")
     spec_parser.add_argument(

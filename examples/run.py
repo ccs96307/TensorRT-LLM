@@ -461,6 +461,10 @@ def main(args):
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
+        if args.hydra_choices is not None:
+            args.hydra_choices = ast.literal_eval(args.hydra_choices)
+            assert args.num_beams == 1, "Hydra should use num_beams == 1"
+            runner_kwargs.update(hydra_choices=args.hydra_choices)
         if args.eagle_choices is not None or args.eagle_posterior_threshold is not None or args.eagle_use_dynamic_tree:
             assert args.num_beams == 1, "Eagle should use num_beams == 1"
             assert not args.use_py_session, "Eagle does not support py session"
@@ -546,6 +550,7 @@ def main(args):
                 no_repeat_ngram_size=args.no_repeat_ngram_size,
                 return_dict=True,
                 medusa_choices=args.medusa_choices,
+                hydra_choices=args.hydra_choices,
                 eagle_choices=args.eagle_choices,
                 return_all_generated_tokens=args.return_all_generated_tokens,
                 input_token_extra_ids=input_token_extra_ids,

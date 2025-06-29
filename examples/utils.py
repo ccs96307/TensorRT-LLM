@@ -454,6 +454,13 @@ def add_common_args(parser):
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
     )
     parser.add_argument(
+        '--hydra_choices',
+        type=str,
+        default=None,
+        help="Configuration of Hydra decoding."
+        "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 hydra tokens."
+    )
+    parser.add_argument(
         '--eagle_choices',
         type=str,
         default=None,

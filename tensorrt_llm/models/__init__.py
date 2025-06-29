@@ -42,6 +42,8 @@ from .gptj.config import GPTJConfig
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .grok.model import GrokForCausalLM
+from .hydra.config import HydraConfig
+from .hydra.model import HydraForCausalLM
 from .llama.config import LLaMAConfig
 from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .mamba.model import MambaForCausalLM
@@ -92,7 +94,9 @@ __all__ = [
     'LlavaNextVisionWrapper',
     'LlavaNextVisionConfig',
     'MedusaConfig',
-    'MedusaForCausalLm',
+    'MedusaForCausalLM',
+    'HydraConfig',
+    'HydraForCausalLM',
     'ReDrafterForCausalLM',
     'GPTJConfig',
     'GPTJModel',
@@ -179,6 +183,7 @@ MODEL_MAP = {
     'GraniteMoeForCausalLM': LLaMAForCausalLM,
     'MedusaForCausalLM': MedusaForCausalLm,
     'MedusaLlamaForCausalLM': MedusaForCausalLm,
+    'HydraForCausalLM': HydraForCausalLM,
     'ReDrafterForCausalLM': ReDrafterForCausalLM,
     'BaichuanForCausalLM': BaichuanForCausalLM,
     'BaiChuanForCausalLM': BaichuanForCausalLM,
